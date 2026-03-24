@@ -123,19 +123,32 @@ export async function generateAndSendReceipt(
   doc.text("PAYMENT DETAILS", margin, y);
   y += 8;
 
-  const monthStr = new Date(payment.rent_month).toLocaleDateString("en-GB", {
+  const monthStr = new Date(payment.rent_month + 'T12:00:00').toLocaleDateString("en-GB", {
     month: "long",
     year: "numeric",
   });
+
+  // Compute rent period from the tenancy start_date day and the rent_month
+  const startDay = new Date(tenancy.start_date).getDate();
+  const rentMonthDate = new Date(payment.rent_month + 'T12:00:00');
+  // Period starts on startDay of the rent_month's month, but could actually be prev month if usage crosses
+  // We reconstruct: from (startDay, prev month) → to (startDay-1, rent_month or startDay, next month)
+  // Simple: period from date = startDay of the previous calendar month (from the due date perspective)
+  // The due date is startDay of the next month after rent_month
+  const periodFrom = new Date(rentMonthDate.getFullYear(), rentMonthDate.getMonth(), startDay);
+  const periodTo = new Date(rentMonthDate.getFullYear(), rentMonthDate.getMonth() + 1, startDay - 1);
+  const formatDate = (d: Date) => d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+  const periodStr = `From: ${formatDate(periodFrom)}   To: ${formatDate(periodTo)}`;
 
   // Format amount without special characters that cause encoding issues
   const formattedAmount = `Rs. ${payment.rent_amount.toLocaleString("en-IN")}`;
 
   // Add Purpose field (Shop for rent)
-  const purposeText = property.details || "Shop for rent";
+  const purposeText = property.details || "Rent Payment";
 
   const paymentDetails = [
     { label: "Rent Month", value: monthStr },
+    { label: "Rent Period", value: periodStr },
     { label: "Purpose", value: purposeText },
     { label: "Amount", value: formattedAmount },
     { label: "Payment Status", value: payment.payment_status.toUpperCase() },
@@ -192,11 +205,22 @@ export async function generateAndSendReceipt(
     throw new Error("Failed to get download link for the receipt");
   }
 
+  // Shorten the signed URL
+  let finalUrl = result.signed_url;
+  try {
+    const response = await fetch(`https://tinyurl.com/api-create.php?url=${encodeURIComponent(result.signed_url)}`);
+    if (response.ok) {
+      finalUrl = await response.text();
+    }
+  } catch (err) {
+    console.warn("Failed to shorten URL, using long URL", err);
+  }
+
   // Save receipt record for idempotency
   await saveReceipt({
     rent_id: payment.rent_id,
     file_path: result.file_path,
-    download_url: result.signed_url,
+    download_url: finalUrl,
     receipt_number: receiptNumber,
   });
 
@@ -205,7 +229,7 @@ export async function generateAndSendReceipt(
     tenant.name,
     monthStr,
     property.address,
-    result.signed_url
+    finalUrl
   );
 
   const encodedMessage = encodeURIComponent(message);

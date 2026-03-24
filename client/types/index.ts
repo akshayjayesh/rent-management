@@ -54,6 +54,7 @@ export interface TenancyDocument {
 export interface PropertyWithTenant extends Property {
   tenancy?: Tenancy & { tenant: Tenant };
   pending_count: number;
+  pending_months?: string[];
 }
 
 export interface LandlordProfile {

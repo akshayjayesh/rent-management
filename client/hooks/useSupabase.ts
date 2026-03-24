@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '@/lib/supabaseClient';
+import { ensureCurrentRentPayments } from '@/services/supabaseAdmin';
 import type { Property, PropertyWithTenant, Tenancy, Tenant, RentPayment } from '@/types/index';
 
 export function useProperties() {
@@ -35,20 +36,36 @@ export function useProperties() {
             .single();
 
           let pending_count = 0;
+          let pending_months: string[] = [];
           if (tenancyData) {
+            // Dynamically ensure rent payments exist for all due months
+            try {
+              await ensureCurrentRentPayments(
+                tenancyData.tenancy_id,
+                tenancyData.start_date,
+                tenancyData.monthly_rent,
+                tenancyData.end_date,
+              );
+            } catch (err) {
+              console.warn('[useProperties] Failed to sync rent payments for tenancy', tenancyData.tenancy_id, err);
+            }
+
             const { data: rentData } = await supabase
               .from('rent_payments')
-              .select('rent_id', { count: 'exact' })
+              .select('rent_id, rent_month')
               .eq('tenancy_id', tenancyData.tenancy_id)
-              .neq('payment_status', 'paid');
+              .neq('payment_status', 'paid')
+              .order('rent_month', { ascending: true });
 
             pending_count = rentData?.length || 0;
+            pending_months = rentData?.map(r => r.rent_month) || [];
           }
 
           return {
             ...property,
             tenancy: tenancyData || undefined,
             pending_count,
+            pending_months,
           };
         })
       );
@@ -105,6 +122,21 @@ export function usePropertyDetail(propertyId: number) {
       if (tenancyData) {
         setTenancy(tenancyData);
 
+        // Dynamically ensure rent payments exist for all due months
+        try {
+          const newCount = await ensureCurrentRentPayments(
+            tenancyData.tenancy_id,
+            tenancyData.start_date,
+            tenancyData.monthly_rent,
+            tenancyData.end_date,
+          );
+          if (newCount > 0) {
+            console.log(`[usePropertyDetail] Auto-generated ${newCount} missing rent payment(s)`);
+          }
+        } catch (err) {
+          console.warn('[usePropertyDetail] Failed to sync rent payments:', err);
+        }
+
         const { data: paymentsData } = await supabase
           .from('rent_payments')
           .select('*')
@@ -133,3 +165,4 @@ export function usePropertyDetail(propertyId: number) {
 
   return { property, tenancy, rentPayments, loading, error, refetch: fetchData };
 }
+

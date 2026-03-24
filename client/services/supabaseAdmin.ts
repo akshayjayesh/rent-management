@@ -208,6 +208,30 @@ export async function markRentAsPartial(id: number, remarks?: string) {
   });
 }
 
+// Helper function to calculate which month a rent payment belongs to based on majority days occupied
+function getUsageMonthString(dueDate: Date, startDay: number): string {
+  // Rent period is from [startDay of prev month] to [startDay - 1 of current month]
+  // dueDate is in the current month
+  
+  const endOfPrevMonth = new Date(dueDate.getFullYear(), dueDate.getMonth(), 0); 
+  const daysInPrevMonth = endOfPrevMonth.getDate() - startDay + 1; // Days stayed in prev month
+  const daysInCurrentMonth = startDay - 1; // Days stayed in current month
+  
+  let usageMonthDate: Date;
+  if (daysInCurrentMonth > daysInPrevMonth) {
+    // Occupied more days in the current month
+    usageMonthDate = new Date(dueDate.getFullYear(), dueDate.getMonth(), 1);
+  } else {
+    // Occupied more days in the previous month
+    usageMonthDate = new Date(dueDate.getFullYear(), dueDate.getMonth() - 1, 1);
+  }
+
+  // Format as YYYY-MM-01 avoiding timezone offset issues
+  const year = usageMonthDate.getFullYear();
+  const month = String(usageMonthDate.getMonth() + 1).padStart(2, '0');
+  return `${year}-${month}-01`;
+}
+
 // Auto-generate rent payments for a new tenancy
 async function autoGenerateRentPayments(
   tenancyId: number,
@@ -240,12 +264,12 @@ async function autoGenerateRentPayments(
 
     if (dueDate <= now) {
       // The rent for the previous month (from startDay of prev month to startDay-1 of this month)
-      // is now due. Set rent_month to the first day of the month when rent is due
-      const rentMonth = new Date(dueDate.getFullYear(), dueDate.getMonth(), 1);
+      // is now due. Set rent_month based on which month had more occupied days
+      const rentMonthStr = getUsageMonthString(dueDate, startDay);
 
       payments.push({
         tenancy_id: tenancyId,
-        rent_month: rentMonth.toISOString().split("T")[0],
+        rent_month: rentMonthStr,
         rent_amount: monthlyRent,
         payment_status: "pending",
         paid_date: null,
@@ -288,7 +312,7 @@ async function syncRentPayments(
 
   if (fetchError) throw fetchError;
 
-  const existingMonths = new Set((existing || []).map((p) => p.rent_month));
+  const existingMonths = new Set((existing || []).map((p) => String(p.rent_month).substring(0, 7)));
 
   // 3. Generate missing pending payments based on new start date
   const start = new Date(startDate);
@@ -311,11 +335,10 @@ async function syncRentPayments(
     );
 
     if (dueDate <= now) {
-      const rentMonth = new Date(dueDate.getFullYear(), dueDate.getMonth(), 1);
-      const rentMonthStr = rentMonth.toISOString().split("T")[0];
+      const rentMonthStr = getUsageMonthString(dueDate, startDay);
 
       // Only add if we don't already have a paid/partial record for this month
-      if (!existingMonths.has(rentMonthStr)) {
+      if (!existingMonths.has(rentMonthStr.substring(0, 7))) {
         newPayments.push({
           tenancy_id: tenancyId,
           rent_month: rentMonthStr,
@@ -341,6 +364,112 @@ async function syncRentPayments(
   // 4. Update 'rent_amount' for existing partial payments if rent changed?
   // (Optional - but usually changing rent doesn't affect past agreements retroactively unless specified)
   // For now, we only update pending rent amounts as they are regenerated.
+}
+
+// Dynamically ensure rent payments exist for all due months up to today
+// This is called when fetching data to catch up on months that have passed
+// since the tenancy was created or last synced.
+export async function ensureCurrentRentPayments(
+  tenancyId: number,
+  startDate: string,
+  monthlyRent: number,
+  endDate?: string | null,
+) {
+  // 1. Delete all existing 'pending' payments (to clear any duplicates)
+  // We keep 'paid' or 'partial' as they represent real transactions
+  const { error: deleteError } = await supabase
+    .from("rent_payments")
+    .delete()
+    .eq("tenancy_id", tenancyId)
+    .eq("payment_status", "pending");
+
+  if (deleteError) throw deleteError;
+
+  // 1b. Calculate the first valid rent month and delete any records before it
+  // (these are legacy records created by the old labeling logic)
+  const startForClean = new Date(startDate);
+  const firstDueDateForClean = new Date(
+    startForClean.getFullYear(),
+    startForClean.getMonth() + 1,
+    startForClean.getDate(),
+  );
+  const firstValidRentMonthStr = getUsageMonthString(firstDueDateForClean, startForClean.getDate());
+  // Delete any records (paid, pending, partial) that are older than the first valid billing month
+  const { error: cleanupError } = await supabase
+    .from("rent_payments")
+    .delete()
+    .eq("tenancy_id", tenancyId)
+    .lt("rent_month", firstValidRentMonthStr);
+  if (cleanupError) throw cleanupError;
+
+  // 2. Fetch existing 'paid' or 'partial' months to avoid duplicates
+  const { data: existing, error: fetchError } = await supabase
+    .from("rent_payments")
+    .select("rent_month")
+    .eq("tenancy_id", tenancyId)
+    .neq("payment_status", "pending");
+
+  if (fetchError) throw fetchError;
+
+  const existingMonths = new Set((existing || []).map((p) => String(p.rent_month).substring(0, 7)));
+
+  // 2. Calculate which months should have rent entries
+  const start = new Date(startDate);
+  const now = new Date();
+  // If tenancy has ended, don't generate beyond the end date
+  const cutoff = endDate ? new Date(endDate) : now;
+  // Use whichever is earlier: cutoff or now
+  const effectiveCutoff = cutoff < now ? cutoff : now;
+
+  const startDay = start.getDate();
+  const newPayments: Omit<RentPayment, "rent_id" | "created_at">[] = [];
+
+  // Start from the first due month (one month after start)
+  let currentMonth = new Date(
+    start.getFullYear(),
+    start.getMonth() + 1,
+    startDay,
+  );
+
+  while (currentMonth <= effectiveCutoff) {
+    const dueDate = new Date(
+      currentMonth.getFullYear(),
+      currentMonth.getMonth(),
+      startDay,
+    );
+
+    if (dueDate <= effectiveCutoff) {
+      const rentMonthStr = getUsageMonthString(dueDate, startDay);
+
+      // Only insert if no record at all exists for this month
+      if (!existingMonths.has(rentMonthStr.substring(0, 7))) {
+        newPayments.push({
+          tenancy_id: tenancyId,
+          rent_month: rentMonthStr,
+          rent_amount: monthlyRent,
+          payment_status: "pending",
+          paid_date: null,
+          remarks: "",
+        });
+      }
+    }
+
+    currentMonth.setMonth(currentMonth.getMonth() + 1);
+  }
+
+  if (newPayments.length > 0) {
+    const { error: insertError } = await supabase
+      .from("rent_payments")
+      .insert(newPayments);
+
+    if (insertError) throw insertError;
+    console.log(
+      `[ensureCurrentRentPayments] Created ${newPayments.length} missing pending payment(s) for tenancy ${tenancyId}`,
+    );
+    return newPayments.length; // Return count of new payments added
+  }
+
+  return 0;
 }
 
 // Dashboard queries

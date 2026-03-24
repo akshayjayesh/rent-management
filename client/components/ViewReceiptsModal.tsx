@@ -46,7 +46,7 @@ export function ViewReceiptsModal({ onClose }: ViewReceiptsModalProps) {
 
               return {
                 ...receipt,
-                tenant_name: payment?.tenancies?.tenants?.name || 'Unknown',
+                tenant_name: (payment?.tenancies as any)?.tenants?.name || 'Unknown',
                 rent_month: payment?.rent_month,
                 rent_amount: payment?.rent_amount,
               };
@@ -74,18 +74,18 @@ export function ViewReceiptsModal({ onClose }: ViewReceiptsModalProps) {
   const handleDownload = async (receipt: ReceiptWithDetails) => {
     try {
       setDownloading(receipt.id);
-      const response = await fetch(receipt.download_url);
-      if (!response.ok) throw new Error('Download failed');
-
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `Receipt_${receipt.receipt_number}.pdf`;
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
+      
+      // Use Supabase's native download support to force the filename securely
+      // This works reliably across all browsers including mobile PWAs
+      const url = new URL(receipt.download_url);
+      url.searchParams.set('download', `Receipt_${receipt.receipt_number}.pdf`);
+      
+      const link = document.createElement("a");
+      link.href = url.toString();
+      link.setAttribute("download", `Receipt_${receipt.receipt_number}.pdf`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
     } catch (err) {
       toast.error('Failed to download receipt');
     } finally {
